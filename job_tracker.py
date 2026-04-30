@@ -2,14 +2,21 @@
 """
 Job Tracker — scans Gmail for job application emails, saves to jobs.xlsx.
 Re-run anytime to pull new emails and update the sheet.
+
+Usage:
+    python3 job_tracker.py               # regex-only classification
+    python3 job_tracker.py --ml          # Ollama for Unknown emails (default: llama3.2)
+    python3 job_tracker.py --ml --model phi3:mini
 """
 
+import argparse
 import base64
 import json
 import re
 from datetime import datetime
 from pathlib import Path
 
+import requests as http
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -24,6 +31,10 @@ TOKEN_FILE    = BASE_DIR / 'token.json'
 OUTPUT_FILE   = BASE_DIR / 'jobs.xlsx'
 MAX_RESULTS   = 500
 
+OLLAMA_URL          = 'http://localhost:11434/api/chat'
+OLLAMA_MODEL_DEFAULT = 'llama3.2'
+VALID_STATUSES      = {'Offer', 'Rejected', 'Interview', 'Applied', 'Unknown'}
+
 # ── Gmail search query ───────────────────────────────────────────────────────
 GMAIL_QUERY = (
     'subject:(application OR interview OR offer OR rejection OR '
@@ -37,9 +48,6 @@ GMAIL_QUERY = (
 )
 
 # ── Academic email filter ────────────────────────────────────────────────────
-# Emails from .edu senders OR with strong academic content are skipped entirely.
-
-# Strong academic content signals — 2+ hits = skip
 ACADEMIC_CONTENT_PATTERNS = [
     r'\bcourse\b', r'\bcoursework\b', r'\bsyllabus\b',
     r'\blecture\b', r'\boffice hours?\b', r'\bprofessor\b', r'\bprof\b',
@@ -58,13 +66,6 @@ ACADEMIC_CONTENT_PATTERNS = [
     r'\bclub meeting\b', r'\bstudent org\b',
 ]
 
-# University domains to always block (regardless of content)
-BLOCKED_UNIVERSITY_DOMAINS = [
-    r'nyu\.edu',
-    r'\.edu\b',   # catch-all for any .edu sender
-]
-
-# Job-specific signals that override academic filter (.edu career center emails)
 JOB_OVERRIDE_PATTERNS = [
     r'career(?:s| center| fair|\.)', r'recruiting', r'internship',
     r'full.?time offer', r'job fair', r'on.?campus (?:recruit|interview|hiring)',
@@ -72,27 +73,21 @@ JOB_OVERRIDE_PATTERNS = [
 
 
 def is_academic_email(sender: str, subject: str, body: str) -> bool:
-    """Return True if email should be excluded as university/academic noise."""
     sender_lower = sender.lower()
     is_edu_sender = bool(re.search(r'@[^>\s]*\.edu\b', sender_lower))
-
     combined = (subject + ' ' + body[:1000]).lower()
 
     if is_edu_sender:
-        # Keep only if clearly job/recruiting related
         for pattern in JOB_OVERRIDE_PATTERNS:
             if re.search(pattern, combined):
                 return False
-        return True  # .edu with no job signal → skip
+        return True
 
-    # Non-.edu: skip if 2+ academic signals
     hits = sum(1 for p in ACADEMIC_CONTENT_PATTERNS if re.search(p, combined))
     return hits >= 2
 
 
-# ── Status detection ─────────────────────────────────────────────────────────
-
-# Noise: skip classification entirely if these match
+# ── Regex status detection ────────────────────────────────────────────────────
 NOISE_PATTERNS = [
     r'job alert',
     r'new jobs? (?:for|matching)',
@@ -103,7 +98,6 @@ NOISE_PATTERNS = [
     r'(?:open|new) (?:roles?|positions?) (?:at|near)',
 ]
 
-# Offer: requires unambiguous "you got the job" language
 OFFER_PATTERNS = [
     r'pleased to (?:offer|extend an offer)',
     r"we(?:'re| are) (?:excited|pleased|happy|delighted) to offer you",
@@ -118,7 +112,6 @@ OFFER_PATTERNS = [
     r'your start date',
 ]
 
-# Rejected: unambiguous decline language
 REJECTED_PATTERNS = [
     r'unfortunately.*(?:not|unable|decided|move)',
     r'not (?:moving|proceed)ing forward with your',
@@ -137,17 +130,6 @@ REJECTED_PATTERNS = [
     r'we regret to inform',
 ]
 
-# Applied: submission confirmation only
-APPLIED_PATTERNS = [
-    r'(?:your )?application (?:has been |was )?(?:received|submitted|confirmed)',
-    r'thank you for (?:applying|your application)',
-    r'we(?:\'ve| have) received your application',
-    r'application (?:successfully )?submitted',
-    r'successfully applied',
-    r'application confirmation',
-]
-
-# Interview: high-confidence scheduling/test signals only
 INTERVIEW_PATTERNS = [
     r'calendly\.com',
     r'zoom\.us/[a-z]',
@@ -169,6 +151,84 @@ INTERVIEW_PATTERNS = [
     r'we(?:\'d| would) like to (?:invite|schedule) you for (?:an )?interview',
 ]
 
+APPLIED_PATTERNS = [
+    r'(?:your )?application (?:has been |was )?(?:received|submitted|confirmed)',
+    r'thank you for (?:applying|your application)',
+    r'we(?:\'ve| have) received your application',
+    r'application (?:successfully )?submitted',
+    r'successfully applied',
+    r'application confirmation',
+]
+
+
+def detect_status_regex(text: str) -> str:
+    t = text.lower()
+
+    for pattern in NOISE_PATTERNS:
+        if re.search(pattern, t):
+            return 'Unknown'
+
+    for pattern in OFFER_PATTERNS:
+        if re.search(pattern, t):
+            return 'Offer'
+
+    for pattern in REJECTED_PATTERNS:
+        if re.search(pattern, t):
+            return 'Rejected'
+
+    for pattern in INTERVIEW_PATTERNS:
+        if re.search(pattern, t):
+            return 'Interview'
+
+    for pattern in APPLIED_PATTERNS:
+        if re.search(pattern, t):
+            return 'Applied'
+
+    return 'Unknown'
+
+
+# ── Ollama classification ─────────────────────────────────────────────────────
+_OLLAMA_PROMPT = """\
+Classify this job application email into exactly one of these categories:
+Offer, Rejected, Interview, Applied, Unknown
+
+Definitions:
+- Offer: Company explicitly offers you a job (mentions compensation, start date, "welcome aboard", signing bonus, or "we'd like to offer you")
+- Rejected: Company explicitly declines your application ("not moving forward", "we regret to inform", "decided to pursue other candidates")
+- Interview: Company wants to schedule an interview or assessment with YOU specifically (scheduling link, HackerRank/Codility test, "we'd like to invite you for an interview")
+- Applied: Company confirms they received your application ("thank you for applying", "application received")
+- Unknown: Job alert, marketing email, newsletter, or unclear
+
+Email Subject: {subject}
+
+Email Body:
+{body}
+
+Reply with one word only — the category name:"""
+
+
+def classify_with_ollama(subject: str, body: str, model: str) -> str | None:
+    """Returns classified status or None on failure (caller falls back to regex)."""
+    prompt = _OLLAMA_PROMPT.format(subject=subject, body=body[:3000])
+    try:
+        resp = http.post(
+            OLLAMA_URL,
+            json={
+                'model': model,
+                'messages': [{'role': 'user', 'content': prompt}],
+                'stream': False,
+                'options': {'temperature': 0, 'num_predict': 8},
+            },
+            timeout=60,
+        )
+        resp.raise_for_status()
+        raw = resp.json()['message']['content'].strip()
+        word = raw.split()[0].strip('.,!?').capitalize()
+        return word if word in VALID_STATUSES else 'Unknown'
+    except Exception:
+        return None
+
+
 # ── Job board domains ────────────────────────────────────────────────────────
 JOB_BOARDS = {
     'LinkedIn':   ['linkedin.com'],
@@ -179,7 +239,7 @@ JOB_BOARDS = {
     'Glassdoor':  ['glassdoor.com'],
 }
 
-# ── Role extraction patterns ─────────────────────────────────────────────────
+# ── Role extraction ──────────────────────────────────────────────────────────
 ROLE_PATTERNS = [
     r'(?:position|role|job|opportunity) (?:of |for |as )?(?:a |an )?([A-Za-z][A-Za-z\s/,-]+?)(?:\s+(?:at|with|in)|[,.]|$)',
     r'(?:applying|applied) (?:for |to )?(?:the )?([A-Za-z][A-Za-z\s/,-]+?)(?:\s+(?:position|role|job)|[,.]|$)',
@@ -209,7 +269,6 @@ def get_gmail_service():
 
 # ── Body extraction ───────────────────────────────────────────────────────────
 def extract_body(payload: dict) -> str:
-    """Recursively extract plain-text body from MIME payload."""
     mime = payload.get('mimeType', '')
     if mime == 'text/plain':
         data = payload.get('body', {}).get('data', '')
@@ -222,35 +281,6 @@ def extract_body(payload: dict) -> str:
             return result
 
     return ''
-
-
-# ── Status detection ──────────────────────────────────────────────────────────
-def detect_status(text: str) -> str:
-    t = text.lower()
-
-    # Discard job-alert / marketing noise immediately
-    for pattern in NOISE_PATTERNS:
-        if re.search(pattern, t):
-            return 'Unknown'
-
-    # Priority order: Offer > Rejected > Interview > Applied
-    for pattern in OFFER_PATTERNS:
-        if re.search(pattern, t):
-            return 'Offer'
-
-    for pattern in REJECTED_PATTERNS:
-        if re.search(pattern, t):
-            return 'Rejected'
-
-    for pattern in INTERVIEW_PATTERNS:
-        if re.search(pattern, t):
-            return 'Interview'
-
-    for pattern in APPLIED_PATTERNS:
-        if re.search(pattern, t):
-            return 'Applied'
-
-    return 'Unknown'
 
 
 def extract_company(sender: str) -> str:
@@ -276,7 +306,6 @@ def extract_company(sender: str) -> str:
 
 def extract_role(subject: str, body: str) -> str:
     clean_subject = re.sub(r'^(re|fw|fwd):\s*', '', subject, flags=re.IGNORECASE).strip()
-    # Use subject + first 500 chars of body for role extraction
     text = clean_subject + ' ' + body[:500]
 
     for pattern in ROLE_PATTERNS:
@@ -297,15 +326,15 @@ def detect_source(sender: str) -> str:
     return 'Direct'
 
 
-def parse_message(msg: dict) -> dict | None:
+def parse_message(msg: dict, use_ml: bool = False, ollama_model: str = OLLAMA_MODEL_DEFAULT) -> dict | None:
     headers = {h['name']: h['value'] for h in msg['payload']['headers']}
     subject = headers.get('Subject', '')
     sender  = headers.get('From', '')
     snippet = msg.get('snippet', '')
     body    = extract_body(msg['payload'])
+    text    = body if body else snippet
 
-    # Skip academic/university emails
-    if is_academic_email(sender, subject, body or snippet):
+    if is_academic_email(sender, subject, text):
         return None
 
     try:
@@ -314,20 +343,33 @@ def parse_message(msg: dict) -> dict | None:
     except Exception:
         date = ''
 
-    # Use full body for detection; fall back to snippet if body empty
-    detection_text = f"{subject} {body if body else snippet}"
-    return {
-        'Date':       date,
-        'Company':    extract_company(sender),
-        'Role':       extract_role(subject, body or snippet),
-        'Status':     detect_status(detection_text),
-        'Source':     detect_source(sender),
-        'Subject':    subject,
-        'Sender':     sender,
-        'Snippet':    snippet[:250],
-        'Message ID': msg['id'],
-        'Thread ID':  msg['threadId'],
+    detection_text = f"{subject} {text}"
+    regex_status   = detect_status_regex(detection_text)
+
+    if use_ml and regex_status == 'Unknown':
+        ml_status = classify_with_ollama(subject, text, ollama_model)
+        status    = ml_status if ml_status is not None else regex_status
+    else:
+        status = regex_status
+
+    record = {
+        'Date':         date,
+        'Company':      extract_company(sender),
+        'Role':         extract_role(subject, text),
+        'Status':       status,
+        'Regex_Status': regex_status,
+        'Source':       detect_source(sender),
+        'Subject':      subject,
+        'Sender':       sender,
+        'Snippet':      snippet[:250],
+        'Message ID':   msg['id'],
+        'Thread ID':    msg['threadId'],
     }
+
+    if not use_ml:
+        del record['Regex_Status']
+
+    return record
 
 
 # ── Fetch ────────────────────────────────────────────────────────────────────
@@ -353,9 +395,26 @@ def fetch_message_ids(service, max_results: int) -> list[dict]:
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 def main():
+    parser = argparse.ArgumentParser(description='Gmail Job Tracker')
+    parser.add_argument('--ml', action='store_true',
+                        help='Use Ollama to classify emails regex marks Unknown')
+    parser.add_argument('--model', default=OLLAMA_MODEL_DEFAULT,
+                        help=f'Ollama model to use (default: {OLLAMA_MODEL_DEFAULT})')
+    args = parser.parse_args()
+
+    if args.ml:
+        # Verify Ollama is reachable before starting
+        try:
+            r = http.get('http://localhost:11434/api/tags', timeout=5)
+            r.raise_for_status()
+            print(f"Ollama ready. Model: {args.model}")
+        except Exception:
+            print("[!] Ollama not reachable at localhost:11434. Run: ollama serve")
+            print("    Falling back to regex-only mode.")
+            args.ml = False
+
     service = get_gmail_service()
 
-    # Load existing
     if OUTPUT_FILE.exists():
         existing_df = pd.read_excel(OUTPUT_FILE, engine='openpyxl')
         seen_ids    = set(existing_df['Message ID'].astype(str))
@@ -364,25 +423,25 @@ def main():
         existing_df = pd.DataFrame()
         seen_ids    = set()
 
-    # Fetch and filter
     refs     = fetch_message_ids(service, MAX_RESULTS)
     new_refs = [r for r in refs if r['id'] not in seen_ids]
     print(f"New emails to process: {len(new_refs)}")
 
-    # Process — fetch full message body now
     records = []
     skipped = 0
+    ml_used = 0
+
     for i, ref in enumerate(new_refs, 1):
         try:
             msg = service.users().messages().get(
-                userId='me',
-                id=ref['id'],
-                format='full',
+                userId='me', id=ref['id'], format='full',
             ).execute()
-            record = parse_message(msg)
+            record = parse_message(msg, use_ml=args.ml, ollama_model=args.model)
             if record is None:
                 skipped += 1
             else:
+                if args.ml and record.get('Regex_Status') == 'Unknown' and record['Status'] != 'Unknown':
+                    ml_used += 1
                 records.append(record)
         except Exception as e:
             print(f"  [!] Error on {ref['id']}: {e}")
@@ -391,8 +450,9 @@ def main():
             print(f"  Processed {i}/{len(new_refs)}...")
 
     print(f"Skipped (academic/university): {skipped}")
+    if args.ml:
+        print(f"Ollama reclassified from Unknown: {ml_used}")
 
-    # Save
     if records:
         new_df   = pd.DataFrame(records)
         final_df = pd.concat([existing_df, new_df], ignore_index=True)
@@ -403,7 +463,6 @@ def main():
         print("\nNo new records — sheet unchanged.")
         final_df = existing_df
 
-    # Summary
     if not final_df.empty:
         print("\n─── Status Summary ───────────────────")
         print(final_df['Status'].value_counts().to_string())

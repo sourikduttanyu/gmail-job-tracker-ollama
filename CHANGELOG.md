@@ -6,6 +6,21 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 
 ---
 
+## [0.4.0] - 2026-04-30
+
+### Added
+- Ollama integration for local LLM classification (`--ml` flag)
+- `--model` flag to choose Ollama model (default: `llama3.2`)
+- Ollama pre-flight check — gracefully falls back to regex if `ollama serve` not running
+- `Regex_Status` column in sheet (only when `--ml` active) for side-by-side comparison
+- Ollama only runs on emails regex marks `Unknown` — fast path for clear-cut cases
+
+### Changed
+- `requests` added explicitly to `requirements.txt`
+- Ollama prompt uses `temperature=0` and `num_predict=8` for deterministic one-word output
+
+---
+
 ## [0.3.0] - 2026-04-30
 
 ### Changed
