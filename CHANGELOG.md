@@ -6,6 +6,20 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 
 ---
 
+## [0.5.0] - 2026-04-30
+
+### Added
+- Streamlit dashboard (`dashboard.py`)
+  - 6 metric cards: Total, Applied, Interview, Offer, Rejected, Unknown
+  - Interview conversion rate caption
+  - Status + Source bar charts
+  - Sidebar filters: status, source, company search, date range
+  - Editable table — Status column only, selectbox-constrained to valid values
+  - Save button writes edits back to `jobs.xlsx`
+- `streamlit` added to `requirements.txt`
+
+---
+
 ## [0.4.0] - 2026-04-30
 
 ### Added
