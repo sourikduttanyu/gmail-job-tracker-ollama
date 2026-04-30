@@ -6,6 +6,25 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 
 ---
 
+## [0.3.0] - 2026-04-30
+
+### Changed
+- Block all `.edu` / NYU senders by default; keep only if career-center/recruiting content detected
+- Rewrote all status detection patterns — each category now requires unambiguous, high-precision language:
+  - **Offer**: requires explicit "we'd like to offer you", "welcome aboard", "compensation package", "your start date", etc.
+  - **Rejected**: requires explicit decline phrases ("not moving forward with your", "we regret to inform", etc.)
+  - **Interview**: requires scheduling signal (Calendly, Zoom meeting link, HackerRank, etc.) or confirmed interview invite — no longer fires on generic "interview" mention
+  - **Applied**: requires submission confirmation language only
+- Added noise filter: job alerts, recommended jobs, marketing emails → always `Unknown`
+- Removed ambiguous single-word triggers (`\boffer\b`, `\binterview\b`, `congratulations` alone, `unfortunately` alone, `other candidates` alone)
+
+### Fixed
+- Offer false positives from any email containing "congratulations" or "\boffer\b"
+- Interview false positives from recruiter intros mentioning interview as a future step
+- Applied false positives from job board marketing
+
+---
+
 ## [0.2.0] - 2026-04-30
 
 ### Changed

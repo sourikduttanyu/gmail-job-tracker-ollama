@@ -36,80 +36,138 @@ GMAIL_QUERY = (
     'noreply OR no-reply)'
 )
 
+# ── Academic email filter ────────────────────────────────────────────────────
+# Emails from .edu senders OR with strong academic content are skipped entirely.
+
+# Strong academic content signals — 2+ hits = skip
+ACADEMIC_CONTENT_PATTERNS = [
+    r'\bcourse\b', r'\bcoursework\b', r'\bsyllabus\b',
+    r'\blecture\b', r'\boffice hours?\b', r'\bprofessor\b', r'\bprof\b',
+    r'\bregistrar\b', r'\bfinancial aid\b', r'\btuition\b', r'\bbursar\b',
+    r'\btranscript\b', r'\bgrade[sd]?\b', r'\bGPA\b',
+    r'\bsemester\b', r'\bquarter\b', r'\bacademic year\b',
+    r'\bcommencement\b', r'\bgraduation ceremony\b',
+    r'\bcampus\b', r'\bdining hall\b', r'\bdormitory\b', r'\bresidence hall\b',
+    r'\bstudent (?:id|account|portal|services|union|government)\b',
+    r'\blibrary\b', r'\bfaculty\b', r'\bcurriculum\b',
+    r'\bTA\b', r'\bteaching assistant\b',
+    r'\bhomework\b', r'\bmidterm\b', r'\bfinal exam\b',
+    r'\bdean\b', r'\bdepartment of \w+\b',
+    r'\benrollment\b', r'\badmission[s]?\b',
+    r'\bstudent loan\b', r'\bfafsa\b',
+    r'\bclub meeting\b', r'\bstudent org\b',
+]
+
+# University domains to always block (regardless of content)
+BLOCKED_UNIVERSITY_DOMAINS = [
+    r'nyu\.edu',
+    r'\.edu\b',   # catch-all for any .edu sender
+]
+
+# Job-specific signals that override academic filter (.edu career center emails)
+JOB_OVERRIDE_PATTERNS = [
+    r'career(?:s| center| fair|\.)', r'recruiting', r'internship',
+    r'full.?time offer', r'job fair', r'on.?campus (?:recruit|interview|hiring)',
+]
+
+
+def is_academic_email(sender: str, subject: str, body: str) -> bool:
+    """Return True if email should be excluded as university/academic noise."""
+    sender_lower = sender.lower()
+    is_edu_sender = bool(re.search(r'@[^>\s]*\.edu\b', sender_lower))
+
+    combined = (subject + ' ' + body[:1000]).lower()
+
+    if is_edu_sender:
+        # Keep only if clearly job/recruiting related
+        for pattern in JOB_OVERRIDE_PATTERNS:
+            if re.search(pattern, combined):
+                return False
+        return True  # .edu with no job signal → skip
+
+    # Non-.edu: skip if 2+ academic signals
+    hits = sum(1 for p in ACADEMIC_CONTENT_PATTERNS if re.search(p, combined))
+    return hits >= 2
+
+
 # ── Status detection ─────────────────────────────────────────────────────────
 
-# High-confidence interview signals — one match alone is enough
-INTERVIEW_HIGH_CONFIDENCE = [
-    r'calendly\.com',
-    r'zoom\.us',
-    r'meet\.google\.com',
-    r'teams\.microsoft\.com',
-    r'please (?:select|choose|pick) a time',
-    r'book (?:a )?(?:time|slot|call)',
-    r'schedule (?:a )?(?:call|interview|meeting|time)',
-    r'hackerrank\.com',
-    r'codility\.com',
-    r'codesignal\.com',
-    r'leetcode\.com',
-    r'take.?home (?:assignment|test|project)',
-    r'technical (?:screen|round|interview|assessment)',
-    r'hiring manager (?:interview|call|round)',
-    r'on-?site interview',
-    r'final (?:round|interview)',
-    r'offer.*extend',   # combined with no rejection = interview stage
-]
-
-# Regular interview signals — need 2+ to count
-INTERVIEW_REGULAR = [
-    r'\binterview\b',
-    r'phone screen',
-    r'phone call',
-    r'video call',
-    r'coding challenge',
-    r'next step',
-    r'moving forward',
-    r'we.?d like to (?:chat|connect|speak|talk)',
-    r'recruiter.*reach',
-    r'reach.*out',
-]
-
-# If any of these match, suppress Interview classification (likely Applied)
-INTERVIEW_NEGATIVE = [
-    r'thank you for (?:applying|your application)',
-    r'application (?:received|confirmed|submitted)',
-    r'we received your application',
-    r'we will (?:review|be in touch)',
-    r"we'll be in touch",
-    r'our team will review',
-    r'under review',
-    r'you will hear from us',
-    r'keep your (?:resume|profile)',
-    r'explore (?:other )?opportunities',
+# Noise: skip classification entirely if these match
+NOISE_PATTERNS = [
     r'job alert',
     r'new jobs? (?:for|matching)',
     r'recommended jobs?',
     r'\d+ new jobs?',
+    r'jobs? you might like',
+    r'based on your (?:profile|resume|search)',
+    r'(?:open|new) (?:roles?|positions?) (?:at|near)',
 ]
 
-STATUS_PATTERNS = {
-    'Offer': [
-        r'offer letter', r'\boffer\b', r'congratulations',
-        r'pleased to inform', r"we'd like to offer", r'happy to extend',
-    ],
-    'Rejected': [
-        r'unfortunately', r'not moving forward', r'moved forward with other',
-        r'not selected', r'decided to pursue other', r'will not be moving',
-        r'position has been filled', r'not a match',
-        r'no longer being considered', r'other candidates',
-        r'we regret', r"we've decided",
-    ],
-    'Applied': [
-        r'application received', r'thank you for applying',
-        r'thank you for your application', r'we received your application',
-        r'application has been submitted', r'successfully applied',
-        r'application confirmation',
-    ],
-}
+# Offer: requires unambiguous "you got the job" language
+OFFER_PATTERNS = [
+    r'pleased to (?:offer|extend an offer)',
+    r"we(?:'re| are) (?:excited|pleased|happy|delighted) to offer you",
+    r"we(?:'d| would) like to offer you",
+    r'offer letter',
+    r'congratulations.*(?:joining|new role|new position|accepted)',
+    r'(?:joining|accepted).*congratulations',
+    r'you have been selected.*(?:join|offer)',
+    r'welcome (?:aboard|to the team)',
+    r'compensation package',
+    r'sign(?:ing)? bonus',
+    r'your start date',
+]
+
+# Rejected: unambiguous decline language
+REJECTED_PATTERNS = [
+    r'unfortunately.*(?:not|unable|decided|move)',
+    r'not (?:moving|proceed)ing forward with your',
+    r'moved forward with (?:other|another) candidate',
+    r'not selected for (?:this|the)',
+    r'decided to pursue other candidates',
+    r'will not be moving forward',
+    r'position has been filled',
+    r'not (?:a match|the right fit) for',
+    r'no longer (?:being considered|moving forward with you)',
+    r"we(?:'re| have) decided not to",
+    r"we've decided to move forward with (?:other|another)",
+    r'after (?:careful )?consideration.*(?:not|decided)',
+    r'wish you (?:all the best|success) in your (?:job )?search',
+    r'we (?:will not|won\'t) be moving',
+    r'we regret to inform',
+]
+
+# Applied: submission confirmation only
+APPLIED_PATTERNS = [
+    r'(?:your )?application (?:has been |was )?(?:received|submitted|confirmed)',
+    r'thank you for (?:applying|your application)',
+    r'we(?:\'ve| have) received your application',
+    r'application (?:successfully )?submitted',
+    r'successfully applied',
+    r'application confirmation',
+]
+
+# Interview: high-confidence scheduling/test signals only
+INTERVIEW_PATTERNS = [
+    r'calendly\.com',
+    r'zoom\.us/[a-z]',
+    r'meet\.google\.com',
+    r'teams\.microsoft\.com/l/meetup',
+    r'hackerrank\.com',
+    r'codility\.com',
+    r'codesignal\.com',
+    r'hirevue\.com',
+    r'take.?home (?:assignment|test|project|challenge)',
+    r'technical (?:screen|round)\b',
+    r'hiring manager (?:interview|call|round)',
+    r'on.?site (?:interview|visit)',
+    r'final (?:round|interview)',
+    r'please (?:select|schedule|choose|pick|book) (?:a )?(?:time|slot|date)',
+    r'schedule (?:a )?(?:30|45|60).?min',
+    r'(?:phone|video) (?:screen|interview) (?:scheduled|confirmed)',
+    r'interview (?:scheduled|confirmed|invitation)',
+    r'we(?:\'d| would) like to (?:invite|schedule) you for (?:an )?interview',
+]
 
 # ── Job board domains ────────────────────────────────────────────────────────
 JOB_BOARDS = {
@@ -170,27 +228,27 @@ def extract_body(payload: dict) -> str:
 def detect_status(text: str) -> str:
     t = text.lower()
 
-    # Offer / Rejected / Applied — single match sufficient
-    for status, patterns in STATUS_PATTERNS.items():
-        for pattern in patterns:
-            if re.search(pattern, t):
-                return status
-
-    # Interview — stricter logic
-    # Bail out if negative signals present (generic application/alert emails)
-    for pattern in INTERVIEW_NEGATIVE:
+    # Discard job-alert / marketing noise immediately
+    for pattern in NOISE_PATTERNS:
         if re.search(pattern, t):
             return 'Unknown'
 
-    # High-confidence: one match enough
-    for pattern in INTERVIEW_HIGH_CONFIDENCE:
+    # Priority order: Offer > Rejected > Interview > Applied
+    for pattern in OFFER_PATTERNS:
+        if re.search(pattern, t):
+            return 'Offer'
+
+    for pattern in REJECTED_PATTERNS:
+        if re.search(pattern, t):
+            return 'Rejected'
+
+    for pattern in INTERVIEW_PATTERNS:
         if re.search(pattern, t):
             return 'Interview'
 
-    # Regular: need 2+ distinct pattern hits
-    hits = sum(1 for p in INTERVIEW_REGULAR if re.search(p, t))
-    if hits >= 2:
-        return 'Interview'
+    for pattern in APPLIED_PATTERNS:
+        if re.search(pattern, t):
+            return 'Applied'
 
     return 'Unknown'
 
@@ -239,12 +297,16 @@ def detect_source(sender: str) -> str:
     return 'Direct'
 
 
-def parse_message(msg: dict) -> dict:
+def parse_message(msg: dict) -> dict | None:
     headers = {h['name']: h['value'] for h in msg['payload']['headers']}
     subject = headers.get('Subject', '')
     sender  = headers.get('From', '')
     snippet = msg.get('snippet', '')
     body    = extract_body(msg['payload'])
+
+    # Skip academic/university emails
+    if is_academic_email(sender, subject, body or snippet):
+        return None
 
     try:
         ts   = int(msg.get('internalDate', 0))
@@ -309,6 +371,7 @@ def main():
 
     # Process — fetch full message body now
     records = []
+    skipped = 0
     for i, ref in enumerate(new_refs, 1):
         try:
             msg = service.users().messages().get(
@@ -316,12 +379,18 @@ def main():
                 id=ref['id'],
                 format='full',
             ).execute()
-            records.append(parse_message(msg))
+            record = parse_message(msg)
+            if record is None:
+                skipped += 1
+            else:
+                records.append(record)
         except Exception as e:
             print(f"  [!] Error on {ref['id']}: {e}")
 
         if i % 50 == 0:
             print(f"  Processed {i}/{len(new_refs)}...")
+
+    print(f"Skipped (academic/university): {skipped}")
 
     # Save
     if records:
