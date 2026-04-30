@@ -482,8 +482,10 @@ def save_excel(df: 'pd.DataFrame', path: 'Path') -> None:
             cell.border    = _THIN_BORDER
             cell.alignment = Alignment(vertical='center', wrap_text=False)
             if cell.column == status_col:
-                if fill: cell.fill = fill
-                if font: cell.font = font
+                if fill:
+                    cell.fill = fill
+                if font:
+                    cell.font = font
 
     # Auto-fit column widths
     for col_cells in ws.columns:

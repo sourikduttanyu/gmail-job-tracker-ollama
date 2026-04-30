@@ -9,12 +9,87 @@ DATA_FILE = Path(__file__).parent / 'jobs.xlsx'
 
 STATUSES = ['Applied', 'Interview', 'Offer', 'Rejected', 'Unknown']
 
+# Status → (background, text, border)
+STATUS_COLORS = {
+    'Applied':   ('#DBEAFE', '#1E40AF', '#93C5FD'),
+    'Interview': ('#FEF9C3', '#854D0E', '#FDE047'),
+    'Offer':     ('#DCFCE7', '#166534', '#86EFAC'),
+    'Rejected':  ('#FEE2E2', '#991B1B', '#FCA5A5'),
+    'Unknown':   ('#F3F4F6', '#374151', '#D1D5DB'),
+}
+
 st.set_page_config(
     page_title="Job Tracker",
     page_icon="📋",
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+st.markdown("""
+<style>
+/* Page header */
+h1 { color: #1A1A2E; font-weight: 700; }
+
+/* Metric cards */
+[data-testid="metric-container"] {
+    background: #FFFFFF;
+    border: 1px solid #D1D5DB;
+    border-radius: 10px;
+    padding: 16px 20px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+}
+[data-testid="metric-container"] label {
+    color: #6B7280;
+    font-size: 0.78rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+[data-testid="metric-container"] [data-testid="stMetricValue"] {
+    color: #1A1A2E;
+    font-size: 1.9rem;
+    font-weight: 700;
+}
+
+/* Sidebar */
+[data-testid="stSidebar"] {
+    background: #EAEFF8;
+    border-right: 1px solid #C7D4EC;
+}
+[data-testid="stSidebar"] h2 { color: #2F5496; }
+
+/* Chart containers */
+[data-testid="stVerticalBlock"] > div > div > div > [data-testid="stVerticalBlock"] {
+    background: #FFFFFF;
+    border-radius: 10px;
+    padding: 12px;
+    border: 1px solid #E5E7EB;
+}
+
+/* Table header */
+[data-testid="stDataEditor"] thead th {
+    background: #2F5496 !important;
+    color: white !important;
+    font-weight: 600;
+}
+
+/* Divider */
+hr { border-color: #D1D5DB; }
+
+/* Save button */
+[data-testid="stButton"] > button {
+    background: #2F5496;
+    color: white;
+    border-radius: 8px;
+    font-weight: 600;
+    padding: 0.5rem 1.5rem;
+    border: none;
+}
+[data-testid="stButton"] > button:hover {
+    background: #1E3A6E;
+}
+</style>
+""", unsafe_allow_html=True)
 
 st.title("📋 Job Tracker")
 
@@ -53,10 +128,10 @@ c4.metric("Offer",     counts.get('Offer',     0))
 c5.metric("Rejected",  counts.get('Rejected',  0))
 c6.metric("Unknown",   counts.get('Unknown',   0))
 
-# Conversion rate: Applied → Interview
-applied_n  = counts.get('Applied',   0)
+# Conversion rate
+applied_n   = counts.get('Applied',   0)
 interview_n = counts.get('Interview', 0)
-total_n    = applied_n + interview_n + counts.get('Offer', 0) + counts.get('Rejected', 0)
+total_n     = applied_n + interview_n + counts.get('Offer', 0) + counts.get('Rejected', 0)
 if total_n > 0:
     rate = round(interview_n / total_n * 100, 1)
     st.caption(f"Interview rate: **{rate}%** of tracked applications reached interview stage")
@@ -97,7 +172,7 @@ with st.sidebar:
 
 
 # ── Apply filters ─────────────────────────────────────────────────────────────
-mask = df['Status'].isin(sel_status) & df['Source'].isin(sel_source)
+mask     = df['Status'].isin(sel_status) & df['Source'].isin(sel_source)
 filtered = df[mask].copy()
 
 if company_query:
@@ -106,8 +181,8 @@ if company_query:
     ]
 
 if len(date_range) == 2:
-    start = pd.Timestamp(date_range[0])
-    end   = pd.Timestamp(date_range[1])
+    start    = pd.Timestamp(date_range[0])
+    end      = pd.Timestamp(date_range[1])
     filtered = filtered[filtered['Date'].between(start, end)]
 
 
@@ -123,7 +198,10 @@ with col_bar:
         .rename_axis('Status')
         .reset_index(name='Count')
     )
-    st.bar_chart(chart_df.set_index('Status')['Count'])
+    st.bar_chart(
+        chart_df.set_index('Status')['Count'],
+        color='#2F5496',
+    )
 
 with col_source:
     st.subheader("Source breakdown")
@@ -133,9 +211,26 @@ with col_source:
         .rename_axis('Source')
         .reset_index(name='Count')
     )
-    st.bar_chart(source_df.set_index('Source')['Count'])
+    st.bar_chart(
+        source_df.set_index('Source')['Count'],
+        color='#0E9F6E',
+    )
 
 st.divider()
+
+
+# ── Status legend ─────────────────────────────────────────────────────────────
+legend_cols = st.columns(len(STATUSES))
+for col, status in zip(legend_cols, STATUSES):
+    bg, fg, border = STATUS_COLORS[status]
+    col.markdown(
+        f'<div style="background:{bg};color:{fg};border:1px solid {border};'
+        f'border-radius:6px;padding:4px 10px;text-align:center;'
+        f'font-weight:600;font-size:0.82rem;">{status}</div>',
+        unsafe_allow_html=True,
+    )
+
+st.write("")
 
 
 # ── Editable table ────────────────────────────────────────────────────────────
@@ -144,7 +239,6 @@ st.subheader(f"Applications — {len(filtered)} shown")
 DISPLAY_COLS = ['Date', 'Company', 'Role', 'Status', 'Source', 'Subject', 'Sender']
 show_cols    = [c for c in DISPLAY_COLS if c in filtered.columns]
 
-# Track original df indices so we can write edits back
 orig_indices = filtered.index.tolist()
 
 edited = st.data_editor(
@@ -156,14 +250,14 @@ edited = st.data_editor(
             required=True,
             width='small',
         ),
-        'Date': st.column_config.DateColumn('Date', width='small'),
+        'Date':    st.column_config.DateColumn('Date',    width='small'),
         'Company': st.column_config.TextColumn('Company', width='medium'),
-        'Role': st.column_config.TextColumn('Role', width='medium'),
-        'Source': st.column_config.TextColumn('Source', width='small'),
+        'Role':    st.column_config.TextColumn('Role',    width='medium'),
+        'Source':  st.column_config.TextColumn('Source',  width='small'),
         'Subject': st.column_config.TextColumn('Subject', width='large'),
-        'Sender': st.column_config.TextColumn('Sender', width='medium'),
+        'Sender':  st.column_config.TextColumn('Sender',  width='medium'),
     },
-    disabled=[c for c in show_cols if c != 'Status'],  # only Status editable
+    disabled=[c for c in show_cols if c != 'Status'],
     hide_index=True,
     use_container_width=True,
 )
