@@ -17,6 +17,8 @@ from datetime import datetime
 from pathlib import Path
 
 import requests as http
+from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -46,6 +48,35 @@ GMAIL_QUERY = (
     'myworkday.com OR glassdoor.com OR recruiting OR talent OR careers OR '
     'noreply OR no-reply)'
 )
+
+# ── Blocked senders / topics — never process these ───────────────────────────
+# Matched against sender name + sender email + subject (case-insensitive)
+BLOCKED_SENDER_PATTERNS = [
+    r'act.?uaw',
+    r'local 7902',
+    r'new york yankees',
+    r'desi party',
+    r'kaggle',
+    r'eventbrite',
+    r'peoplesync',
+    r'edward carr',
+    r'the economist',
+    r'nyu it.*survey',
+    r'user satisfaction survey',
+    r'tassel',
+    r'mailsuite',
+    r'nyu tandon career hub',
+    r'glassdoor jobs',
+    r'office of records',
+    r'records and registration',
+    r'peter voltz',
+]
+
+
+def is_blocked(sender: str, subject: str) -> bool:
+    haystack = (sender + ' ' + subject).lower()
+    return any(re.search(p, haystack) for p in BLOCKED_SENDER_PATTERNS)
+
 
 # ── Academic email filter ────────────────────────────────────────────────────
 ACADEMIC_CONTENT_PATTERNS = [
@@ -334,6 +365,9 @@ def parse_message(msg: dict, use_ml: bool = False, ollama_model: str = OLLAMA_MO
     body    = extract_body(msg['payload'])
     text    = body if body else snippet
 
+    if is_blocked(sender, subject):
+        return None
+
     if is_academic_email(sender, subject, text):
         return None
 
@@ -391,6 +425,78 @@ def fetch_message_ids(service, max_results: int) -> list[dict]:
 
     print(f"Found {len(refs)} matching emails.")
     return refs
+
+
+# ── Excel export with colour-coding + auto-fit ───────────────────────────────
+_STATUS_FILLS = {
+    'Offer':     PatternFill('solid', fgColor='C6EFCE'),  # green
+    'Interview': PatternFill('solid', fgColor='FFEB9C'),  # yellow
+    'Applied':   PatternFill('solid', fgColor='BDD7EE'),  # blue
+    'Rejected':  PatternFill('solid', fgColor='FFC7CE'),  # red
+    'Unknown':   PatternFill('solid', fgColor='EDEDED'),  # grey
+}
+_STATUS_FONTS = {
+    'Offer':     Font(bold=True, color='006100'),
+    'Interview': Font(bold=True, color='9C6500'),
+    'Applied':   Font(bold=True, color='1F4E79'),
+    'Rejected':  Font(bold=True, color='9C0006'),
+    'Unknown':   Font(color='595959'),
+}
+_HEADER_FILL = PatternFill('solid', fgColor='2F5496')
+_HEADER_FONT = Font(bold=True, color='FFFFFF')
+_THIN_BORDER = Border(
+    left=Side(style='thin', color='D9D9D9'),
+    right=Side(style='thin', color='D9D9D9'),
+    top=Side(style='thin', color='D9D9D9'),
+    bottom=Side(style='thin', color='D9D9D9'),
+)
+
+
+def save_excel(df: 'pd.DataFrame', path: 'Path') -> None:
+    df.to_excel(path, index=False, engine='openpyxl')
+
+    from openpyxl import load_workbook
+    wb = load_workbook(path)
+    ws = wb.active
+
+    # Style header row
+    for cell in ws[1]:
+        cell.fill      = _HEADER_FILL
+        cell.font      = _HEADER_FONT
+        cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=False)
+        cell.border    = _THIN_BORDER
+
+    # Find Status column index (1-based)
+    status_col = None
+    for idx, cell in enumerate(ws[1], 1):
+        if cell.value == 'Status':
+            status_col = idx
+            break
+
+    # Style data rows
+    for row in ws.iter_rows(min_row=2):
+        status_val = row[status_col - 1].value if status_col else None
+        fill = _STATUS_FILLS.get(status_val)
+        font = _STATUS_FONTS.get(status_val)
+        for cell in row:
+            cell.border    = _THIN_BORDER
+            cell.alignment = Alignment(vertical='center', wrap_text=False)
+            if cell.column == status_col:
+                if fill: cell.fill = fill
+                if font: cell.font = font
+
+    # Auto-fit column widths
+    for col_cells in ws.columns:
+        max_len = max(
+            (len(str(c.value)) if c.value is not None else 0) for c in col_cells
+        )
+        col_letter = get_column_letter(col_cells[0].column)
+        ws.column_dimensions[col_letter].width = min(max_len + 4, 60)
+
+    # Freeze top row
+    ws.freeze_panes = 'A2'
+
+    wb.save(path)
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -457,7 +563,7 @@ def main():
         new_df   = pd.DataFrame(records)
         final_df = pd.concat([existing_df, new_df], ignore_index=True)
         final_df.sort_values('Date', ascending=False, inplace=True)
-        final_df.to_excel(OUTPUT_FILE, index=False, engine='openpyxl')
+        save_excel(final_df, OUTPUT_FILE)
         print(f"\nSaved {len(final_df)} total records → {OUTPUT_FILE}")
     else:
         print("\nNo new records — sheet unchanged.")

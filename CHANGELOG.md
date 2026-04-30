@@ -6,6 +6,21 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 
 ---
 
+## [0.6.0] - 2026-04-30
+
+### Added
+- Explicit blocklist (`BLOCKED_SENDER_PATTERNS`) for known noise senders: ACT-UAW, Yankees, Kaggle, Eventbrite, PeopleSync, The Economist, Tassel, Mailsuite, NYU Tandon Career Hub, Glassdoor Jobs alerts, Office of Records, Peter Voltz, and others
+- `is_blocked()` pre-filter — checked before academic filter, zero processing cost
+- Excel colour-coding by Status:
+  - Offer → green | Interview → yellow | Applied → blue | Rejected → red | Unknown → grey
+  - Bold coloured font on Status cell matching row colour
+  - Dark blue header row with white bold text
+  - Thin border grid on all cells
+- Auto-fit column widths (capped at 60 chars)
+- Freeze top row (header stays visible when scrolling)
+
+---
+
 ## [0.5.0] - 2026-04-30
 
 ### Added
