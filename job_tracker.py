@@ -4,6 +4,7 @@ Job Tracker — scans Gmail for job application emails, saves to jobs.xlsx.
 Re-run anytime to pull new emails and update the sheet.
 """
 
+import base64
 import json
 import re
 from datetime import datetime
@@ -35,7 +36,61 @@ GMAIL_QUERY = (
     'noreply OR no-reply)'
 )
 
-# ── Status detection (order = priority) ─────────────────────────────────────
+# ── Status detection ─────────────────────────────────────────────────────────
+
+# High-confidence interview signals — one match alone is enough
+INTERVIEW_HIGH_CONFIDENCE = [
+    r'calendly\.com',
+    r'zoom\.us',
+    r'meet\.google\.com',
+    r'teams\.microsoft\.com',
+    r'please (?:select|choose|pick) a time',
+    r'book (?:a )?(?:time|slot|call)',
+    r'schedule (?:a )?(?:call|interview|meeting|time)',
+    r'hackerrank\.com',
+    r'codility\.com',
+    r'codesignal\.com',
+    r'leetcode\.com',
+    r'take.?home (?:assignment|test|project)',
+    r'technical (?:screen|round|interview|assessment)',
+    r'hiring manager (?:interview|call|round)',
+    r'on-?site interview',
+    r'final (?:round|interview)',
+    r'offer.*extend',   # combined with no rejection = interview stage
+]
+
+# Regular interview signals — need 2+ to count
+INTERVIEW_REGULAR = [
+    r'\binterview\b',
+    r'phone screen',
+    r'phone call',
+    r'video call',
+    r'coding challenge',
+    r'next step',
+    r'moving forward',
+    r'we.?d like to (?:chat|connect|speak|talk)',
+    r'recruiter.*reach',
+    r'reach.*out',
+]
+
+# If any of these match, suppress Interview classification (likely Applied)
+INTERVIEW_NEGATIVE = [
+    r'thank you for (?:applying|your application)',
+    r'application (?:received|confirmed|submitted)',
+    r'we received your application',
+    r'we will (?:review|be in touch)',
+    r"we'll be in touch",
+    r'our team will review',
+    r'under review',
+    r'you will hear from us',
+    r'keep your (?:resume|profile)',
+    r'explore (?:other )?opportunities',
+    r'job alert',
+    r'new jobs? (?:for|matching)',
+    r'recommended jobs?',
+    r'\d+ new jobs?',
+]
+
 STATUS_PATTERNS = {
     'Offer': [
         r'offer letter', r'\boffer\b', r'congratulations',
@@ -48,12 +103,6 @@ STATUS_PATTERNS = {
         r'no longer being considered', r'other candidates',
         r'we regret', r"we've decided",
     ],
-    'Interview': [
-        r'\binterview\b', r'phone screen', r'phone call', r'video call',
-        r'coding challenge', r'technical assessment', r'take.home',
-        r'hackerrank', r'codility', r'schedule.*call', r'next step',
-        r'hiring manager', r'technical round',
-    ],
     'Applied': [
         r'application received', r'thank you for applying',
         r'thank you for your application', r'we received your application',
@@ -64,12 +113,12 @@ STATUS_PATTERNS = {
 
 # ── Job board domains ────────────────────────────────────────────────────────
 JOB_BOARDS = {
-    'LinkedIn':  ['linkedin.com'],
-    'Indeed':    ['indeed.com'],
-    'Greenhouse':['greenhouse.io'],
-    'Lever':     ['lever.co'],
-    'Workday':   ['myworkday.com', 'workday.com'],
-    'Glassdoor': ['glassdoor.com'],
+    'LinkedIn':   ['linkedin.com'],
+    'Indeed':     ['indeed.com'],
+    'Greenhouse': ['greenhouse.io'],
+    'Lever':      ['lever.co'],
+    'Workday':    ['myworkday.com', 'workday.com'],
+    'Glassdoor':  ['glassdoor.com'],
 }
 
 # ── Role extraction patterns ─────────────────────────────────────────────────
@@ -100,18 +149,53 @@ def get_gmail_service():
     return build('gmail', 'v1', credentials=creds)
 
 
-# ── Parsers ──────────────────────────────────────────────────────────────────
+# ── Body extraction ───────────────────────────────────────────────────────────
+def extract_body(payload: dict) -> str:
+    """Recursively extract plain-text body from MIME payload."""
+    mime = payload.get('mimeType', '')
+    if mime == 'text/plain':
+        data = payload.get('body', {}).get('data', '')
+        if data:
+            return base64.urlsafe_b64decode(data + '==').decode('utf-8', errors='ignore')
+
+    for part in payload.get('parts', []):
+        result = extract_body(part)
+        if result:
+            return result
+
+    return ''
+
+
+# ── Status detection ──────────────────────────────────────────────────────────
 def detect_status(text: str) -> str:
-    text_lower = text.lower()
+    t = text.lower()
+
+    # Offer / Rejected / Applied — single match sufficient
     for status, patterns in STATUS_PATTERNS.items():
         for pattern in patterns:
-            if re.search(pattern, text_lower):
+            if re.search(pattern, t):
                 return status
+
+    # Interview — stricter logic
+    # Bail out if negative signals present (generic application/alert emails)
+    for pattern in INTERVIEW_NEGATIVE:
+        if re.search(pattern, t):
+            return 'Unknown'
+
+    # High-confidence: one match enough
+    for pattern in INTERVIEW_HIGH_CONFIDENCE:
+        if re.search(pattern, t):
+            return 'Interview'
+
+    # Regular: need 2+ distinct pattern hits
+    hits = sum(1 for p in INTERVIEW_REGULAR if re.search(p, t))
+    if hits >= 2:
+        return 'Interview'
+
     return 'Unknown'
 
 
 def extract_company(sender: str) -> str:
-    # Try display name before angle bracket
     m = re.match(r'"?([^"<@\n]+?)"?\s*<', sender)
     if m:
         name = m.group(1).strip()
@@ -121,7 +205,6 @@ def extract_company(sender: str) -> str:
         if name.lower() not in skip and len(name) > 1:
             return name
 
-    # Fall back to domain without TLD
     m = re.search(r'@([^.@>]+)\.', sender)
     if m:
         domain = m.group(1)
@@ -133,10 +216,10 @@ def extract_company(sender: str) -> str:
     return 'Unknown'
 
 
-def extract_role(subject: str, snippet: str) -> str:
-    # Clean subject prefixes
+def extract_role(subject: str, body: str) -> str:
     clean_subject = re.sub(r'^(re|fw|fwd):\s*', '', subject, flags=re.IGNORECASE).strip()
-    text = clean_subject + ' ' + snippet
+    # Use subject + first 500 chars of body for role extraction
+    text = clean_subject + ' ' + body[:500]
 
     for pattern in ROLE_PATTERNS:
         m = re.search(pattern, text, re.IGNORECASE)
@@ -161,6 +244,7 @@ def parse_message(msg: dict) -> dict:
     subject = headers.get('Subject', '')
     sender  = headers.get('From', '')
     snippet = msg.get('snippet', '')
+    body    = extract_body(msg['payload'])
 
     try:
         ts   = int(msg.get('internalDate', 0))
@@ -168,12 +252,13 @@ def parse_message(msg: dict) -> dict:
     except Exception:
         date = ''
 
-    combined = f"{subject} {snippet}"
+    # Use full body for detection; fall back to snippet if body empty
+    detection_text = f"{subject} {body if body else snippet}"
     return {
         'Date':       date,
         'Company':    extract_company(sender),
-        'Role':       extract_role(subject, snippet),
-        'Status':     detect_status(combined),
+        'Role':       extract_role(subject, body or snippet),
+        'Status':     detect_status(detection_text),
         'Source':     detect_source(sender),
         'Subject':    subject,
         'Sender':     sender,
@@ -222,15 +307,14 @@ def main():
     new_refs = [r for r in refs if r['id'] not in seen_ids]
     print(f"New emails to process: {len(new_refs)}")
 
-    # Process
+    # Process — fetch full message body now
     records = []
     for i, ref in enumerate(new_refs, 1):
         try:
             msg = service.users().messages().get(
                 userId='me',
                 id=ref['id'],
-                format='metadata',
-                metadataHeaders=['Subject', 'From', 'Date'],
+                format='full',
             ).execute()
             records.append(parse_message(msg))
         except Exception as e:
